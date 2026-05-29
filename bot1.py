@@ -1,19 +1,28 @@
 import telebot, pymongo, random, os
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# CONFIG (Environment Variables ကို သုံးပါ)
+# CONFIGURATION
 bot = telebot.TeleBot(os.getenv("TOKEN"))
-db = pymongo.MongoClient(os.getenv("MONGO_URI"))['bot_database']
+client = pymongo.MongoClient(os.getenv("MONGO_URI"))
+db = client['bot_database']
+brain_collection = db['brain']
+settings_collection = db['settings_collection']
 ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS").split(",")]
 
-# Memory Cache (မြန်ဆန်စေရန်)
+# Cache အတွက် Memory ထဲမှာ အရင်ဆွဲတင်ထားမယ်
 brain_cache = {}
-for doc in db['brain'].find():
-    inp = doc['input_text']
-    if inp not in brain_cache: brain_cache[inp] = []
-    brain_cache[inp].append({"reply": doc.get("reply_text"), "sticker": doc.get("sticker_id")})
+def load_cache():
+    global brain_cache
+    brain_cache = {}
+    for doc in brain_collection.find():
+        inp = doc['input_text']
+        if inp not in brain_cache: brain_cache[inp] = []
+        brain_cache[inp].append({"reply": doc.get("reply_text"), "sticker": doc.get("sticker_id")})
+    print(f"✅ Cache Loaded: {len(brain_cache)} entries.")
 
-# /start Command
+load_cache()
+
+# START COMMAND
 @bot.message_handler(commands=['start'])
 def start_msg(m):
     kb = InlineKeyboardMarkup()
@@ -21,47 +30,58 @@ def start_msg(m):
     text = (
         "🤖 မင်္ဂလာပါ! ကျွန်တော်က သင်တို့ရဲ့ Group တွေကို အသက်ဝင်စေမယ့် Myanmar Friend Bot ပါ။\n\n"
         "💬 လုပ်ဆောင်ချက်များ:\n"
-        "• သင်ပြောသမျှကို သင်ယူပြီး စကားပြန်ပြောပေးခြင်း။\n"
-        "• Sticker တွေကိုလည်း မှတ်သားပြီး ပြန်လည်အသုံးပြုခြင်း။\n\n"
+        "• စကားပြော/Sticker များကို သင်ယူပြီး ပြန်လည်ဖြေကြားပေးခြင်း။\n\n"
         "အောက်က Button ကိုနှိပ်ပြီး သင့် Group ထဲကို ခေါ်ဆောင်လိုက်ပါ။ 🚀"
     )
     bot.send_message(m.chat.id, text, reply_markup=kb)
 
-# /broadcast Command
+# BROADCAST COMMAND
 @bot.message_handler(commands=['broadcast'])
 def broadcast(m):
     if m.from_user.id in ADMIN_IDS and m.reply_to_message:
-        groups = db['settings_collection'].find_one({"_id": "bot_config"}).get("groups", [])
+        config = settings_collection.find_one({"_id": "bot_config"})
+        groups = config.get("groups", []) if config else []
         for gid in groups:
             try: bot.forward_message(gid, m.chat.id, m.reply_to_message.message_id)
             except: continue
         bot.reply_to(m, "✅ Broadcast ပို့ပြီးပါပြီ။")
 
-# Learning & Reply System
+# MAIN HANDLING (Learn & Reply)
 @bot.message_handler(func=lambda m: True)
 def handle(m):
-    # Learn (Reply ထောက်ထားရင်)
+    # 1. LEARNING SYSTEM (Reply ထောက်ထားရင် မှတ်မယ်)
     if m.reply_to_message:
-        inp = m.reply_to_message.text.lower().strip()
-        reply, stk = m.text, (m.sticker.file_id if m.sticker else None)
-        # အဖြေတူနေရင် မမှတ်တော့ဘူး
-        if inp in brain_cache and any(i['reply'] == reply and i['sticker'] == stk for i in brain_cache[inp]): return
+        # Input ကို စာဖြစ်ဖြစ် Sticker ID ဖြစ်ဖြစ် ယူမယ်
+        parent = m.reply_to_message.text.lower().strip() if m.reply_to_message.text else (m.reply_to_message.sticker.file_id if m.reply_to_message.sticker else None)
         
-        db['brain'].insert_one({"input_text": inp, "reply_text": reply, "sticker_id": stk})
-        if inp not in brain_cache: brain_cache[inp] = []
-        brain_cache[inp].append({"reply": reply, "sticker": stk})
-        return
+        if parent:
+            reply_text = m.text
+            reply_stk = m.sticker.file_id if m.sticker else None
+            
+            # တူညီတာရှိမရှိ စစ်မယ်
+            if parent in brain_cache and any(i['reply'] == reply_text and i['sticker'] == reply_stk for i in brain_cache[parent]): 
+                return
+            
+            # DB ထဲ မှတ်မယ်
+            brain_collection.insert_one({"input_text": parent, "reply_text": reply_text, "sticker_id": reply_stk})
+            if parent not in brain_cache: brain_cache[parent] = []
+            brain_cache[parent].append({"reply": reply_text, "sticker": reply_stk})
+            return
 
-    # Reply (စာသားအတိုင်းပြန်ဖြေ)
-    text = m.text.lower().strip() if m.text else ""
-    if text in brain_cache:
-        choice = random.choice(brain_cache[text])
-        if choice['sticker']: bot.send_sticker(m.chat.id, choice['sticker'], reply_to_message_id=m.message_id)
-        elif choice['reply']: bot.reply_to(m, choice['reply'])
+    # 2. FAST REPLY SYSTEM
+    current_input = m.text.lower().strip() if m.text else (m.sticker.file_id if m.sticker else None)
     
-    # Auto Register Group (Database ထဲ group ID မှတ်ထားပေး)
+    if current_input and current_input in brain_cache:
+        choice = random.choice(brain_cache[current_input])
+        if choice['sticker']: 
+            bot.send_sticker(m.chat.id, choice['sticker'], reply_to_message_id=m.message_id)
+        if choice['reply']: 
+            bot.reply_to(m, choice['reply'])
+    
+    # 3. AUTO REGISTER GROUP
     if m.chat.type in ['group', 'supergroup']:
-        db['settings_collection'].update_one({"_id": "bot_config"}, {"$addToSet": {"groups": m.chat.id}}, upsert=True)
+        settings_collection.update_one({"_id": "bot_config"}, {"$addToSet": {"groups": m.chat.id}}, upsert=True)
 
 if __name__ == '__main__':
+    print("🚀 Bot is running...")
     bot.infinity_polling(skip_pending=True)
